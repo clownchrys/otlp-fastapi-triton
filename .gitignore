@@ -1,1 +1,3 @@
 tempo/data/
+triton/examples/model_repository/inception_graphdef/
+triton/examples/model_repository/densenet_onnx/
