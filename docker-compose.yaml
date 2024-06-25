@@ -1,0 +1,145 @@
+# docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
+x-loki-logging: &loki-logging
+  driver: loki
+  options:
+    loki-url: http://localhost:3100/api/prom/push
+    loki-pipeline-stages: |
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}:\d{2}'
+          max_wait_time: 3s
+      - regex:
+          expression: '^(?P<time>\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}:\d{2},d{3}) (?P<message>(?s:.*))$$' 
+
+version: '3'
+
+services:
+
+  triton:
+    depends_on:
+      - loki
+    logging: *loki-logging
+    container_name: triton
+    hostname: triton
+    image: otlp:triton
+    build:
+      context: ./triton
+    command: [
+      "tritonserver",
+      "--model-repository", "/model_repository",
+      "--trace-config", "rate=0",
+      "--trace-config", "level=TIMESTAMPS",
+      "--trace-config", "count=-1",
+      "--trace-config", "mode=opentelemetry",
+      "--trace-config", "opentelemetry,url=tempo:4317/v1/traces",
+      # "--trace-config", "opentelemetry,url=otlp-collector:4317/v1/traces",
+      "--trace-config", "opentelemetry,resource=test.key=test.value",
+      "--trace-config", "opentelemetry,resource=service.name=test_triton",
+    ]
+    volumes:
+      - ./triton/examples/model_repository:/model_repository:ro
+    environment: []
+      # - OTLP_ENDPOINT=http://otlp-collector:4317
+    ports:
+      - "8000:8000" # Triton HTTP Port
+      - "8001:8001" # Triton GRPC Port
+      - "8002:8002" # Triton Prometheus Port
+
+  fastapi:
+    logging: *loki-logging
+    depends_on:
+      - loki
+    container_name: fastapi
+    hostname: fastapi
+    image: otlp:fastapi
+    build:
+      context: ./fastapi
+    command:
+      - python
+      - main.py
+    volumes:
+      - ./fastapi/app:/app:ro
+    environment:
+      - OTLP_ENDPOINT=http://tempo:4317
+      - EXPOSE_PORT=9000
+    ports:
+      - "9000:9000"
+
+  ############# ETC ################
+
+  loki:
+    container_name: loki
+    image: grafana/loki:3.0.0
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+
+  tempo:
+    container_name: tempo
+    image: grafana/tempo:2.4.1
+    command: 
+      # - -config.file=/etc/tempo/config.yaml
+      - --target=all
+      - --storage.trace.backend=local
+      - --storage.trace.local.path=/var/tempo
+      - --auth.enabled=false
+    volumes:
+      - ./tempo/config.yaml:/etc/tempo/config.yaml:ro
+      - ./tempo/data:/var/tempo
+    ports:
+      - "14268"  # jaeger ingest
+      - "3200"   # tempo
+      - "4317"  # otlp grpc
+      - "4318"  # otlp http
+      - "9411"   # zipkin
+
+  grafana:
+    depends_on:
+      - prometheus
+    container_name: grafana
+    image: grafana/grafana:10.4.2
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/dashboards
+    ports:
+      - "3000:3000"
+
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus:v2.51.2
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --web.enable-remote-write-receiver
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus:/etc/prometheus
+    ports:
+      - "9090:9090"
+
+  # https://opentelemetry.io/docs/languages/sdk-configuration/otlp-exporter
+  otlp-collector:
+    container_name: otlp-collector
+    hostname: otlp-collector
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    command:
+      - "--config=/etc/otlp-collector/config.yaml"
+    volumes:
+      - ./otlp-collector/config.yaml:/etc/otlp-collector/config.yaml
+    ports:
+      - "4317" # OTLP gRPC receiver
+      - "4318" # OTLP http receiver
+      - "8889" # Prometheus metrics exporter
+
+  # jaeger-collector:
+  #   container_name: jaeger-collector
+  #   hostname: jaeger-collector
+  #   image: jaegertracing/jaeger-collector:1.57.0
+  #   command: 
+  #     # - "--cassandra.keyspace=jaeger_v1_dc1"
+  #     # - "--cassandra.servers=cassandra"
+  #     - "--collector.otlp.enabled=true"
+  #   environment: 
+  #     - SAMPLING_CONFIG_TYPE=adaptive
+  #   ports:
+  #     - "4317" # accept OpenTelemetry Protocol (OTLP) over gRPC
+  #     - "4318" # accept OpenTelemetry Protocol (OTLP) over HTTP
